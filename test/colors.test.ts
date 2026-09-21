@@ -88,7 +88,7 @@ test("protects Markdown destinations, references, autolinks, and URL fragments",
 
 test("does not rewrite inline, indented, or fenced code", () => {
   const input = [
-    "`#fff` and `rgba(1, 2, 3, .5)`",
+    "`color #fff` and `prefix rgba(1, 2, 3, .5) suffix`",
     "",
     "```css",
     "#000",
@@ -102,6 +102,65 @@ test("does not rewrite inline, indented, or fenced code", () => {
     "`#fff\\`",
   ].join("\n");
   assert.equal(transform(input), input);
+});
+
+test("appends swatches after standalone inline code spans", () => {
+  const input = "`#fff` and ``rgba(1, 2, 3, .5)`` and `#000`";
+  const output = transform(input);
+  assert.equal(
+    output,
+    "`#fff` \u001b[38;2;255;255;255m■\u001b[39m[]() and ``rgba(1, 2, 3, .5)`` \u001b[38;2;1;2;3m■\u001b[39m[]() 50% and `#000` \u001b[38;2;0;0;0m■\u001b[39m",
+  );
+  assert.equal(transform(output), output);
+  assert.equal(transform("`color #fff` and `#fff extra`"), "`color #fff` and `#fff extra`");
+  assert.equal(
+    transform("` #fff `"),
+    "` #fff ` \u001b[38;2;255;255;255m■\u001b[39m",
+  );
+  assert.equal(
+    transform("`\n#fff\n`"),
+    "`\n#fff\n` \u001b[38;2;255;255;255m■\u001b[39m",
+  );
+  assert.equal(
+    transform("```#fff``` then #000"),
+    "```#fff``` \u001b[38;2;255;255;255m■\u001b[39m[]() then #000 \u001b[38;2;0;0;0m■\u001b[39m",
+  );
+
+  const escapedOpening = transform("\\`#fff`#000`");
+  assert.equal((escapedOpening.match(/38;2;/g) ?? []).length, 2);
+  assert.match(escapedOpening, /`#000` \u001b\[38;2;0;0;0m■/);
+  assert.doesNotMatch(escapedOpening, /`#000 \u001b/);
+
+  const table = "| color |\n| --- |\n| `#fff` |";
+  assert.equal(transform(table), "| color |\n| --- |\n| `#fff` \u001b[38;2;255;255;255m■\u001b[39m[]() |");
+});
+
+test("renders standalone code-span swatches through pi-tui Markdown", () => {
+  const style = (text: string) => text;
+  const theme = {
+    heading: style,
+    link: style,
+    linkUrl: style,
+    code: (text: string) => `\u001b[32m${text}\u001b[39m`,
+    codeBlock: style,
+    codeBlockBorder: style,
+    quote: style,
+    quoteBorder: style,
+    hr: style,
+    listBullet: style,
+    bold: style,
+    italic: style,
+    strikethrough: style,
+    underline: style,
+  };
+  setCapabilities(TRUECOLOR);
+  const rendered = new Markdown(transform("`#fff`"), 0, 0, theme, { color: style }).render(80)[0]!;
+  assert.match(rendered, /\u001b\[32m#fff\u001b\[39m/);
+  assert.equal(visibleWidth(rendered.trimEnd()), "#fff ■".length);
+
+  const escapedOpening = new Markdown(transform("\\`#fff`#000`"), 0, 0, theme, { color: style }).render(80).join("\n");
+  assert.doesNotMatch(escapedOpening, /\[\]\(\)/);
+  assert.match(escapedOpening, /\u001b\[32m#000\u001b\[39m/);
 });
 
 test("protects HTML tags and raw HTML blocks", () => {

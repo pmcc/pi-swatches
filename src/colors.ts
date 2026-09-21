@@ -174,6 +174,13 @@ interface ProtectedRange {
   end: number;
 }
 
+interface InlineCodeSpan {
+  start: number;
+  end: number;
+  literalStart: number;
+  literalEnd: number;
+}
+
 function isInRange(position: number, ranges: readonly ProtectedRange[]): boolean {
   return ranges.some((range) => position >= range.start && position < range.end);
 }
@@ -299,7 +306,7 @@ function protectHTML(markdown: string, ranges: ProtectedRange[]): void {
 }
 
 /** Find Markdown regions where inserting display-only text would change syntax or content. */
-function protectedMarkdownRanges(markdown: string): ProtectedRange[] {
+function protectedMarkdownRanges(markdown: string, inlineCodeSpans: InlineCodeSpan[]): ProtectedRange[] {
   const ranges: ProtectedRange[] = [];
 
   // Fences are recognized after removing blockquote/list containers. This
@@ -317,8 +324,11 @@ function protectedMarkdownRanges(markdown: string): ProtectedRange[] {
       const close = new RegExp(`^ {0,3}${fence.character}{${fence.length},}[ \\t]*$`).test(content);
       if (close) fence = undefined;
     } else {
-      const opening = /^( {0,3})(`{3,}|~{3,})/.exec(content);
-      if (opening) {
+      const opening = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(content);
+      // A backtick fence's info string cannot contain a backtick. Such a line
+      // may instead contain an inline code span, for example ```#fff```.
+      const validOpening = opening && (opening[2][0] !== "`" || !opening[3].includes("`"));
+      if (validOpening) {
         addLineRange(ranges, lineStart, lineEnd);
         fence = { character: opening[2][0], length: opening[2].length };
       } else if (/^(?: {4}|\t)/.test(line) || /^(?: {4}|\t)/.test(content)) {
@@ -335,7 +345,7 @@ function protectedMarkdownRanges(markdown: string): ProtectedRange[] {
   // unmatched backtick is rendered as text by marked, including while typing.
   // Backslashes do not escape backticks inside a code span.
   for (let index = 0; index < markdown.length; index += 1) {
-    if (markdown[index] !== "`" || isInRange(index, ranges)) continue;
+    if (markdown[index] !== "`" || isEscaped(markdown, index) || isInRange(index, ranges)) continue;
     let runEnd = index + 1;
     while (markdown[runEnd] === "`") runEnd += 1;
     const run = markdown.slice(index, runEnd);
@@ -344,8 +354,15 @@ function protectedMarkdownRanges(markdown: string): ProtectedRange[] {
       close = markdown.indexOf(run, close + 1);
     }
     if (close >= 0) {
-      addRange(ranges, index, close + run.length);
-      index = close + run.length - 1;
+      const spanEnd = close + run.length;
+      addRange(ranges, index, spanEnd);
+      inlineCodeSpans.push({
+        start: index,
+        end: spanEnd,
+        literalStart: runEnd,
+        literalEnd: close,
+      });
+      index = spanEnd - 1;
     } else index = runEnd - 1;
   }
 
@@ -461,10 +478,39 @@ export interface TransformOptions {
 
 /** Add terminal-only swatches while preserving Markdown syntax and source literals. */
 export function transformColors(markdown: string, options: TransformOptions): string {
-  const protectedRanges = protectedMarkdownRanges(markdown);
-  let changed = false;
-  let result = "";
-  let lastIndex = 0;
+  const inlineCodeSpans: InlineCodeSpan[] = [];
+  const protectedRanges = protectedMarkdownRanges(markdown, inlineCodeSpans);
+  const insertions: { position: number; text: string }[] = [];
+
+  // A code span is eligible only when its complete source content is one color
+  // literal. Other code spans remain byte-for-byte protected, and spans inside
+  // another protected construct (such as a link destination) stay protected too.
+  for (const span of inlineCodeSpans) {
+    const protectedByOtherSyntax = protectedRanges.some((range) =>
+      !(range.start === span.start && range.end === span.end)
+      && range.start < span.end && range.end > span.start,
+    );
+    if (protectedByOtherSyntax) continue;
+
+    const sourceContent = markdown.slice(span.literalStart, span.literalEnd);
+    // CommonMark converts line endings to spaces, then removes one surrounding
+    // space when both ends are spaces. Match that normalization while leaving
+    // the original source untouched.
+    const normalizedContent = sourceContent.replace(/\r\n?|\n/g, " ");
+    const literal = normalizedContent.length > 1
+      && normalizedContent.startsWith(" ")
+      && normalizedContent.endsWith(" ")
+      && /[^ ]/.test(normalizedContent)
+      ? normalizedContent.slice(1, -1)
+      : normalizedContent;
+    const parsed = parseColorLiteral(literal);
+    if (!parsed || isIncompleteStreamingHex(literal, span.literalEnd, markdown.length, options.isStreaming)) continue;
+    if (ANSI_DECORATION_RE.test(markdown.slice(span.end))) continue;
+    insertions.push({
+      position: span.end,
+      text: decoration(parsed, options.trueColor, span.end < markdown.length || parsed.alpha !== undefined),
+    });
+  }
 
   for (const match of markdown.matchAll(CANDIDATE_RE)) {
     const full = match[0];
@@ -478,17 +524,20 @@ export function transformColors(markdown: string, options: TransformOptions): st
     if (!parsed || !hasSafeBoundaries(markdown, literalStart, end)
       || isInRange(literalStart, protectedRanges)
       || isIncompleteStreamingHex(literal, end, markdown.length, options.isStreaming)) continue;
-
-    result += markdown.slice(lastIndex, end);
-    if (ANSI_DECORATION_RE.test(markdown.slice(end))) {
-      lastIndex = end;
-      continue;
-    }
-    result += decoration(parsed, options.trueColor, end < markdown.length || parsed.alpha !== undefined);
-    lastIndex = end;
-    changed = true;
+    if (ANSI_DECORATION_RE.test(markdown.slice(end))) continue;
+    insertions.push({
+      position: end,
+      text: decoration(parsed, options.trueColor, end < markdown.length || parsed.alpha !== undefined),
+    });
   }
 
-  if (!changed) return markdown;
+  if (insertions.length === 0) return markdown;
+  insertions.sort((left, right) => left.position - right.position);
+  let result = "";
+  let lastIndex = 0;
+  for (const insertion of insertions) {
+    result += markdown.slice(lastIndex, insertion.position) + insertion.text;
+    lastIndex = insertion.position;
+  }
   return result + markdown.slice(lastIndex);
 }
