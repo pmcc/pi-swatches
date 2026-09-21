@@ -14,6 +14,10 @@ pi -e ./src/index.ts
 
 The pi package manifest loads the included TypeScript source directly. The build remains useful for typechecking and tests.
 
+## Example
+
+![Color swatches for dark and light terminal modes](assets/color-swatches-example.png)
+
 ## Supported syntax
 
 - Hex: `#RGB`, `#RGBA`, `#RRGGBB`, and `#RRGGBBAA` (case preserved)
